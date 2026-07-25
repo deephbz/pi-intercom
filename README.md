@@ -7,7 +7,7 @@
 Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
 
 ```text
-User flow: press Alt+M or run /intercom to pick a session and send a message
+User flow: run /intercom enable once, then press Alt+M or run /intercom to pick a session and send a message
 ```
 
 ## Why
@@ -20,11 +20,11 @@ Sometimes you're running multiple pi sessions — one researching, one executing
 
 Unlike pi-messenger (a shared chat room for multi-agent swarms), pi-intercom is for targeted 1:1 communication where you pick the recipient.
 
-Pi-intercom also integrates well with [pi-subagents](https://github.com/nicobailon/pi-subagents): delegated child agents get a child-only `contact_supervisor` tool when `pi-subagents` supplies bridge metadata. Use `reason: "need_decision"` for blocking clarification, `reason: "interview_request"` for multiple structured supervisor answers, and `reason: "progress_update"` for meaningful plan-changing updates. Normal sessions only see the regular `intercom` tool.
+Pi-intercom also integrates well with [pi-subagents](https://github.com/nicobailon/pi-subagents): enabled delegated child agents get a child-only `contact_supervisor` tool when `pi-subagents` supplies bridge metadata. Use `reason: "need_decision"` for blocking clarification, `reason: "interview_request"` for multiple structured supervisor answers, and `reason: "progress_update"` for meaningful plan-changing updates. Enabled normal sessions only see the regular `intercom` tool.
 
 ## In One Minute
 
-Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
+Intercom is disabled by default, so a newly installed extension neither connects to the broker nor exposes its agent-facing tools. Run `/intercom enable` to persistently activate it; Pi then reloads the extension runtime so the `intercom` tool and enabled messaging behavior are registered. Each enabled session connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension also gives you a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
 
 ## Install
 
@@ -32,7 +32,7 @@ Each pi session that has `pi-intercom` loaded and enabled connects to a tiny loc
 pi install npm:pi-intercom
 ```
 
-Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
+Then restart Pi. Intercom starts disabled; run `/intercom enable` in a session to activate its runtime and bundled messaging tools. The bundled `pi-intercom` skill remains available for common coordination patterns.
 
 **Recommended:** Add this snippet to your project's `AGENTS.md` to help agents understand when to coordinate across sessions:
 
@@ -50,7 +50,7 @@ Coordinate with other local pi sessions on related codebases. Use `/skill:pi-int
 
 A session becomes intercom-connected when all of these are true:
 - the `pi-intercom` extension is installed and loaded in that session
-- `enabled` is not set to `false` in the intercom config file, which defaults to `~/.pi/agent/intercom/config.json`
+- `enabled` is set to `true` in the intercom config file, which defaults to `~/.pi/agent/intercom/config.json`
 - the session has started or reloaded after the extension was installed
 - the local broker is running or can be auto-started
 
@@ -62,7 +62,7 @@ If a session is unnamed, pi-intercom now exposes a runtime-only fallback alias l
 
 ### From the Keyboard
 
-Press **Alt+M** or type `/intercom` to open the session list overlay:
+First run `/intercom enable`. Pi atomically persists the state and reloads the extension so its tools can appear; this reload is required because Pi does not support unregistering a registered tool in place. Once enabled, press **Alt+M** or type bare `/intercom` to open the session list overlay:
 
 1. **Select a session** — Use arrow keys to pick a target session
 2. **Compose message** — Write your message in the compose overlay
@@ -308,6 +308,17 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 
 ## Tool Reference
 
+### Lifecycle command
+
+`/intercom` has a strict command family:
+
+- `/intercom` opens the overlay when enabled; when disabled it explains how to enable it without contacting the broker.
+- `/intercom enable` atomically writes `enabled: true`, then reloads the extension runtime. Repeating it reports that it is already enabled.
+- `/intercom disable` atomically writes `enabled: false`, then reloads the extension runtime. The reloaded disabled runtime has no `intercom` or subagent `contact_supervisor` tool and opens no broker connection. Repeating it reports that it is already disabled.
+- `/intercom status` reports the persisted runtime state and never contacts the broker.
+
+The reload is intentional: Pi can register a dynamic tool but cannot unregister one, so reloading after persistence is how disabling truly removes the agent-facing tools. `Alt+M` remains the enabled overlay shortcut.
+
 ### intercom
 
 | Parameter | Type | Description |
@@ -367,7 +378,7 @@ Create `~/.pi/agent/intercom/config.json`:
   "brokerArgs": ["--no-install", "tsx"],
   "confirmSend": false,
   "inboundTrigger": "always",
-  "enabled": true,
+  "enabled": false,
   "replyHint": true,
   "status": "researching"
 }
@@ -379,7 +390,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before non-reply sends from an interactive session with UI |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
-| `enabled` | true | Enable/disable intercom entirely |
+| `enabled` | false | Durable lifecycle state. Use `/intercom enable` or `/intercom disable`; transitions reload the extension so agent-facing tools accurately appear or disappear. |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 
@@ -424,7 +435,7 @@ graph TB
     B2 <-->|Local Socket/Pipe| B3
 ```
 
-The broker is a standalone TypeScript process that manages session registration and message routing. It auto-spawns when the first intercom-enabled session needs it and exits after 5 seconds when the last connected session disconnects. Clients now reconnect automatically if the broker disappears and later comes back.
+The broker is a standalone TypeScript process that manages session registration and message routing. It auto-spawns when the first enabled intercom session needs it and exits after 5 seconds when the last connected session disconnects. Disabled sessions never start or connect to it. Clients now reconnect automatically if the broker disappears and later comes back.
 
 Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
 

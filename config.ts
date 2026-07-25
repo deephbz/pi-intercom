@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 import { getIntercomDirPath } from "./broker/paths.ts";
 
 export const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -35,7 +35,7 @@ export interface IntercomConfig {
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
   
-  /** Enable/disable intercom (default: true) */
+  /** Enable/disable intercom (default: false) */
   enabled: boolean;
   
   /** Show reply hint in incoming messages (default: true) */
@@ -51,9 +51,48 @@ const defaults: IntercomConfig = {
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
   inboundTrigger: "always",
-  enabled: true,
+  enabled: false,
   replyHint: true,
 };
+
+export interface SetIntercomEnabledResult {
+  previousEnabled: boolean;
+  enabled: boolean;
+}
+
+function readConfigObject(configPath: string): Record<string, unknown> {
+  if (!existsSync(configPath)) {
+    return {};
+  }
+  const parsed: unknown = JSON.parse(readFileSync(configPath, "utf-8"));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Config must be a JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Persist the desired lifecycle state without exposing a partially written config.
+ * A malformed existing config is deliberately left untouched so an explicit user
+ * action cannot silently discard their other settings.
+ */
+export function setIntercomEnabled(enabled: boolean): SetIntercomEnabledResult {
+  const configPath = getConfigPath();
+  const raw = readConfigObject(configPath);
+  const previousEnabled = loadConfig().enabled;
+  const next = { ...raw, enabled };
+  const tempPath = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  mkdirSync(dirname(configPath), { recursive: true });
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tempPath, configPath);
+  } finally {
+    if (existsSync(tempPath)) {
+      try { unlinkSync(tempPath); } catch { /* Best effort cleanup. */ }
+    }
+  }
+  return { previousEnabled, enabled };
+}
 
 export function loadConfig(): IntercomConfig {
   const configPath = getConfigPath();

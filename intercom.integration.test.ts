@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter, once } from "node:events";
@@ -24,6 +24,8 @@ const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
+mkdirSync(path.join(sharedHomeDir, ".pi", "agent", "intercom"), { recursive: true });
+writeFileSync(path.join(sharedHomeDir, ".pi", "agent", "intercom", "config.json"), JSON.stringify({ enabled: true }));
 const { IntercomClient } = await import("./broker/client.ts");
 process.on("exit", () => {
   process.env.HOME = previousHome;
@@ -143,6 +145,8 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
   const tools: CapturedTool[] = [];
   const entries: Array<{ type: string; data: unknown }> = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  let reloadCount = 0;
   const sentMessages: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean; deliverAs?: string } }> = [];
   const pi = {
     getSessionName: () => typeof sessionName === "function" ? sessionName() : sessionName,
@@ -179,7 +183,10 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     isIdle: options.isIdle ?? (() => true),
     hasUI: options.hasUI ?? false,
     abort: options.abort ?? (() => undefined),
-    ui: options.ui,
+    ui: options.ui ?? {
+      notify: (message: string, level: string) => notifications.push({ message, level }),
+    },
+    reload: async () => { reloadCount += 1; },
   };
   return {
     pi,
@@ -187,6 +194,8 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     tools,
     commands,
     entries,
+    notifications,
+    get reloadCount() { return reloadCount; },
     sentMessages,
     async emitLifecycle(event: string, payload: unknown = {}, eventContext: unknown = ctx) {
       for (const handler of lifecycleHandlers.get(event) ?? []) {
@@ -201,6 +210,19 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
       return results;
     },
   };
+}
+
+async function withIsolatedAgentDir<T>(fn: (agentDir: string) => T | Promise<T>): Promise<T> {
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-agent-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    return await fn(agentDir);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(agentDir, { recursive: true, force: true });
+  }
 }
 
 async function connectRawRegistered(sessionId: string, name: string, sessionOverrides: Record<string, unknown> = {}) {
@@ -236,6 +258,58 @@ async function connectRawRegistered(sessionId: string, name: string, sessionOver
   await registered;
   return { socket, writeMessage };
 }
+
+test("extension lifecycle command gates tools and broker startup across reloads", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  await withIsolatedAgentDir(async (agentDir) => {
+    const disabled = createExtensionHarness("gated-session", { hasUI: true });
+    piIntercomExtension(disabled.pi as never);
+
+    assert.deepEqual(disabled.tools.map((tool) => tool.name), []);
+    assert.ok(disabled.commands.has("intercom"));
+    await disabled.emitLifecycle("session_start");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(existsSync(path.join(agentDir, "intercom", "broker.sock")), false);
+
+    await disabled.commands.get("intercom")!("status", disabled.ctx);
+    await disabled.commands.get("intercom")!("bad extra", disabled.ctx);
+    await disabled.commands.get("intercom")!("", disabled.ctx);
+    assert.deepEqual(disabled.notifications.map(({ message }) => message), [
+      "Intercom is disabled.",
+      "Usage: /intercom [enable|disable|status]",
+      "Intercom is disabled. Run /intercom enable to activate it.",
+    ]);
+
+    await disabled.commands.get("intercom")!("enable", disabled.ctx);
+    assert.equal(disabled.reloadCount, 1);
+    assert.equal(existsSync(path.join(agentDir, "intercom", "config.json")), true);
+    await disabled.commands.get("intercom")!("enable", disabled.ctx);
+    assert.equal(disabled.reloadCount, 1);
+
+    const enabled = createExtensionHarness("gated-session", { hasUI: true });
+    piIntercomExtension(enabled.pi as never);
+    assert.deepEqual(enabled.tools.map((tool) => tool.name), ["intercom"]);
+
+    await enabled.commands.get("intercom")!("disable", enabled.ctx);
+    assert.equal(enabled.reloadCount, 1);
+    const disabledAfterReload = createExtensionHarness("gated-session", { hasUI: true });
+    piIntercomExtension(disabledAfterReload.pi as never);
+    assert.deepEqual(disabledAfterReload.tools.map((tool) => tool.name), []);
+    await disabledAfterReload.commands.get("intercom")!("disable", disabledAfterReload.ctx);
+    assert.equal(disabledAfterReload.reloadCount, 0);
+
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "supervisor",
+      runId: "run-1",
+      agent: "worker",
+      index: "0",
+    }, () => {
+      const disabledChild = createExtensionHarness("child", { hasUI: true });
+      piIntercomExtension(disabledChild.pi as never);
+      assert.deepEqual(disabledChild.tools.map((tool) => tool.name), []);
+    });
+  });
+});
 
 test("opt-in TCP broker requires endpoint state for health and registration", { concurrency: false }, async () => {
   const net = await import("node:net");

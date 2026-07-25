@@ -8,7 +8,7 @@ import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
+import { getAskTimeoutMs, loadConfig, setIntercomEnabled, type IntercomConfig } from "./config.ts";
 import type { SessionInfo, Message, Attachment } from "./types.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
 
@@ -1160,7 +1160,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
 
   const childOrchestratorMetadata = readChildOrchestratorMetadata();
-  if (childOrchestratorMetadata) {
+  if (config.enabled && childOrchestratorMetadata) {
     pi.registerTool({
       name: "contact_supervisor",
       label: "Contact Supervisor",
@@ -1422,7 +1422,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     } as any);
   }
 
-  pi.registerTool({
+  if (config.enabled) {
+    pi.registerTool({
     name: "intercom",
     label: "Intercom",
     description: `Send a message to another pi session running on this machine.
@@ -1803,9 +1804,16 @@ Usage:
       }
       return new Text(text, 0, 0);
     },
-  } as any);
+    } as any);
+  }
 
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
+    if (!config.enabled) {
+      if (ctx.hasUI) {
+        ctx.ui.notify("Intercom is disabled. Run /intercom enable to activate it.", "info");
+      }
+      return;
+    }
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
     if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
@@ -1875,8 +1883,36 @@ Usage:
   }
 
   pi.registerCommand("intercom", {
-    description: "Open session intercom overlay",
-    handler: async (_args, ctx) => openIntercomOverlay(ctx),
+    description: "Open the intercom overlay or manage its lifecycle: enable, disable, status",
+    handler: async (args, ctx) => {
+      const action = args.trim();
+      if (action === "") {
+        await openIntercomOverlay(ctx);
+        return;
+      }
+      if (action === "status") {
+        ctx.ui.notify(`Intercom is ${config.enabled ? "enabled" : "disabled"}.`, "info");
+        return;
+      }
+      if (action !== "enable" && action !== "disable") {
+        ctx.ui.notify("Usage: /intercom [enable|disable|status]", "error");
+        return;
+      }
+
+      const enabled = action === "enable";
+      try {
+        const result = setIntercomEnabled(enabled);
+        if (result.previousEnabled === enabled) {
+          ctx.ui.notify(`Intercom is already ${enabled ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+        ctx.ui.notify(`Intercom ${enabled ? "enabled" : "disabled"}. Reloading runtime...`, "info");
+        await ctx.reload();
+        return;
+      } catch (error) {
+        ctx.ui.notify(`Failed to ${action} intercom: ${getErrorMessage(error)}`, "error");
+      }
+    },
   });
 
   pi.registerShortcut("alt+m", {
