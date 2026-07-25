@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { IntercomClient } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
@@ -26,6 +26,14 @@ const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+
+const INTERCOM_COMMAND_USAGE = "/intercom [enable|disable|status|help]";
+const INTERCOM_COMMAND_COMPLETIONS: AutocompleteItem[] = [
+  { value: "enable", label: "enable", description: "Persist enabled state and reload the extension runtime to activate intercom tools." },
+  { value: "disable", label: "disable", description: "Persist disabled state and reload the extension runtime to remove intercom tools." },
+  { value: "status", label: "status", description: "Show the persisted state without contacting the broker." },
+  { value: "help", label: "help", description: "Show usage and lifecycle behavior without changing anything." },
+];
 
 interface ChildOrchestratorMetadata {
   orchestratorTarget: string;
@@ -1883,7 +1891,13 @@ Usage:
   }
 
   pi.registerCommand("intercom", {
-    description: "Open the intercom overlay or manage its lifecycle: enable, disable, status",
+    description: "Open the overlay, or use /intercom [enable|disable|status|help]; enable and disable reload the extension runtime.",
+    getArgumentCompletions: (prefix) => {
+      if (/\s/.test(prefix)) return null;
+      const normalizedPrefix = prefix.toLowerCase();
+      const completions = INTERCOM_COMMAND_COMPLETIONS.filter((item) => item.value.startsWith(normalizedPrefix));
+      return completions.length > 0 ? completions : null;
+    },
     handler: async (args, ctx) => {
       const action = args.trim();
       if (action === "") {
@@ -1894,24 +1908,40 @@ Usage:
         ctx.ui.notify(`Intercom is ${config.enabled ? "enabled" : "disabled"}.`, "info");
         return;
       }
+      if (action === "help") {
+        ctx.ui.notify(
+          `Usage: ${INTERCOM_COMMAND_USAGE}\n\n/intercom opens the overlay when enabled. enable and disable persist the setting and reload the extension runtime so intercom tools appear or disappear. status reports the saved state; help does not change settings or contact the broker.`,
+          "info",
+        );
+        return;
+      }
       if (action !== "enable" && action !== "disable") {
-        ctx.ui.notify("Usage: /intercom [enable|disable|status]", "error");
+        ctx.ui.notify(`Usage: ${INTERCOM_COMMAND_USAGE}`, "error");
         return;
       }
 
       const enabled = action === "enable";
+      let result: { previousEnabled: boolean };
       try {
-        const result = setIntercomEnabled(enabled);
-        if (result.previousEnabled === enabled) {
-          ctx.ui.notify(`Intercom is already ${enabled ? "enabled" : "disabled"}.`, "info");
-          return;
-        }
-        ctx.ui.notify(`Intercom ${enabled ? "enabled" : "disabled"}. Reloading runtime...`, "info");
-        await ctx.reload();
-        return;
+        result = setIntercomEnabled(enabled);
       } catch (error) {
-        ctx.ui.notify(`Failed to ${action} intercom: ${getErrorMessage(error)}`, "error");
+        ctx.ui.notify(`Failed to save intercom setting: ${getErrorMessage(error)}`, "error");
+        return;
       }
+      if (result.previousEnabled === enabled) {
+        ctx.ui.notify(`Intercom is already ${enabled ? "enabled" : "disabled"}.`, "info");
+        return;
+      }
+      ctx.ui.notify(`Intercom ${enabled ? "enabled" : "disabled"}. Reloading runtime...`, "info");
+      try {
+        await ctx.reload();
+      } catch (error) {
+        ctx.ui.notify(
+          `Intercom setting was saved as ${enabled ? "enabled" : "disabled"}, but runtime reload failed. This session remains ${config.enabled ? "enabled" : "disabled"}; run /reload to apply it: ${getErrorMessage(error)}`,
+          "error",
+        );
+      }
+      return;
     },
   });
 

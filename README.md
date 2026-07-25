@@ -316,6 +316,7 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 - `/intercom enable` atomically writes `enabled: true`, then reloads the extension runtime. Repeating it reports that it is already enabled.
 - `/intercom disable` atomically writes `enabled: false`, then reloads the extension runtime. The reloaded disabled runtime has no `intercom` or subagent `contact_supervisor` tool and opens no broker connection. Repeating it reports that it is already disabled.
 - `/intercom status` reports the persisted runtime state and never contacts the broker.
+- `/intercom help` shows usage plus extension-runtime reload semantics without changing config or contacting the broker. Typing `/intercom ` offers case-insensitive `enable`, `disable`, `status`, and `help` completions with descriptions.
 
 The reload is intentional: Pi can register a dynamic tool but cannot unregister one, so reloading after persistence is how disabling truly removes the agent-facing tools. `Alt+M` remains the enabled overlay shortcut.
 

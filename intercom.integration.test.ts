@@ -137,12 +137,17 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   hasUI?: boolean;
   isIdle?: () => boolean;
   mode?: "tui" | "rpc" | "json" | "print";
+  reload?: () => Promise<void>;
   ui?: unknown;
   sessionId?: string | (() => string);
 } = {}) {
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const commandOptions = new Map<string, {
+    description?: string;
+    getArgumentCompletions?: (prefix: string) => unknown;
+  }>();
   const tools: CapturedTool[] = [];
   const entries: Array<{ type: string; data: unknown }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
@@ -166,8 +171,13 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     registerTool: (tool: CapturedTool) => {
       tools.push(tool);
     },
-    registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
+    registerCommand: (name: string, command: {
+      description?: string;
+      getArgumentCompletions?: (prefix: string) => unknown;
+      handler: (args: string, ctx: unknown) => unknown;
+    }) => {
       commands.set(name, command.handler);
+      commandOptions.set(name, command);
     },
     registerShortcut: () => undefined,
     sendMessage: (message: { customType?: string; content?: string; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
@@ -186,13 +196,14 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     ui: options.ui ?? {
       notify: (message: string, level: string) => notifications.push({ message, level }),
     },
-    reload: async () => { reloadCount += 1; },
+    reload: options.reload ?? (async () => { reloadCount += 1; }),
   };
   return {
     pi,
     ctx,
     tools,
     commands,
+    commandOptions,
     entries,
     notifications,
     get reloadCount() { return reloadCount; },
@@ -267,16 +278,33 @@ test("extension lifecycle command gates tools and broker startup across reloads"
 
     assert.deepEqual(disabled.tools.map((tool) => tool.name), []);
     assert.ok(disabled.commands.has("intercom"));
+    const command = disabled.commandOptions.get("intercom")!;
+    assert.match(command.description!, /\/intercom \[enable\|disable\|status\|help\]/);
+    assert.deepEqual(command.getArgumentCompletions!("").map((item: any) => item.value), ["enable", "disable", "status", "help"]);
+    assert.deepEqual(command.getArgumentCompletions!("di"), [{
+      value: "disable",
+      label: "disable",
+      description: "Persist disabled state and reload the extension runtime to remove intercom tools.",
+    }]);
+    assert.deepEqual(command.getArgumentCompletions!("DI"), command.getArgumentCompletions!("di"));
+    assert.equal(command.getArgumentCompletions!("unknown"), null);
+    assert.equal(command.getArgumentCompletions!("enable extra"), null);
+    assert.ok(command.getArgumentCompletions!("").every((item: any) => typeof item.description === "string" && item.description.length > 0));
     await disabled.emitLifecycle("session_start");
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(existsSync(path.join(agentDir, "intercom", "broker.sock")), false);
 
     await disabled.commands.get("intercom")!("status", disabled.ctx);
+    await disabled.commands.get("intercom")!("help", disabled.ctx);
+    assert.equal(disabled.reloadCount, 0);
+    assert.equal(existsSync(path.join(agentDir, "intercom", "config.json")), false);
+    assert.equal(existsSync(path.join(agentDir, "intercom", "broker.sock")), false);
     await disabled.commands.get("intercom")!("bad extra", disabled.ctx);
     await disabled.commands.get("intercom")!("", disabled.ctx);
     assert.deepEqual(disabled.notifications.map(({ message }) => message), [
       "Intercom is disabled.",
-      "Usage: /intercom [enable|disable|status]",
+      "Usage: /intercom [enable|disable|status|help]\n\n/intercom opens the overlay when enabled. enable and disable persist the setting and reload the extension runtime so intercom tools appear or disappear. status reports the saved state; help does not change settings or contact the broker.",
+      "Usage: /intercom [enable|disable|status|help]",
       "Intercom is disabled. Run /intercom enable to activate it.",
     ]);
 
@@ -308,6 +336,27 @@ test("extension lifecycle command gates tools and broker startup across reloads"
       piIntercomExtension(disabledChild.pi as never);
       assert.deepEqual(disabledChild.tools.map((tool) => tool.name), []);
     });
+  });
+});
+
+test("intercom reports a saved setting when runtime reload fails", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  await withIsolatedAgentDir(async (agentDir) => {
+    const harness = createExtensionHarness("reload-failure", {
+      hasUI: true,
+      reload: async () => { throw new Error("reload unavailable"); },
+    });
+    piIntercomExtension(harness.pi as never);
+
+    await harness.commands.get("intercom")!("enable", harness.ctx);
+
+    assert.equal(harness.reloadCount, 0);
+    assert.equal(existsSync(path.join(agentDir, "intercom", "config.json")), true);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), []);
+    assert.deepEqual(harness.notifications.map(({ message }) => message), [
+      "Intercom enabled. Reloading runtime...",
+      "Intercom setting was saved as enabled, but runtime reload failed. This session remains disabled; run /reload to apply it: reload unavailable",
+    ]);
   });
 });
 
